@@ -16,8 +16,6 @@ from dataclasses import dataclass
 from typing import Optional, List
 import warnings
 import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 from bs4 import BeautifulSoup
 import time
 import random
@@ -25,117 +23,74 @@ import random
 warnings.filterwarnings("ignore")
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  RATE-LIMIT-PROOF SESSION + CACHED yfinance FETCHERS
-#  ROOT CAUSE: Streamlit Cloud shares one IP across thousands of apps.
-#  Yahoo Finance blocks shared IPs that make too many requests.
-#  FIX 1 — Rotate User-Agent headers so requests look like a real browser.
-#  FIX 2 — Wrap every yf call in @st.cache_data(ttl=3600) so the same
-#           ticker is only fetched ONCE per hour, not on every UI interaction.
-#  FIX 3 — Retry with exponential backoff on 429 / 5xx responses.
+#  RATE-LIMIT HANDLING
+#  New yfinance (0.2.40+) manages its own curl_cffi session internally and
+#  REJECTS any externally passed session. The fixes are:
+#  FIX 1 — Cache every yfinance call with @st.cache_data(ttl=3600) so
+#           the same ticker is only fetched ONCE per hour.
+#  FIX 2 — Wrap calls in retry logic with exponential backoff.
+#  FIX 3 — Never pass session= to yf.Ticker().
 # ─────────────────────────────────────────────────────────────────────────────
 
-USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 "
-    "(KHTML, like Gecko) Version/17.2.1 Safari/605.1.15",
-    "Mozilla/5.0 (X11; Linux x86_64; rv:124.0) Gecko/20100101 Firefox/124.0",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0",
-]
-
-def _make_session() -> requests.Session:
-    """Build a requests Session with retry logic and rotating User-Agent."""
-    session = requests.Session()
-    retry = Retry(
-        total=5,
-        backoff_factor=1.5,          # waits: 1.5s, 3s, 6s, 12s, 24s
-        status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["GET"],
-        raise_on_status=False,
-    )
-    adapter = HTTPAdapter(max_retries=retry)
-    session.mount("https://", adapter)
-    session.mount("http://", adapter)
-    session.headers.update({
-        "User-Agent": random.choice(USER_AGENTS),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Connection": "keep-alive",
-    })
-    return session
-
-
-def _yf_ticker_with_session(ticker: str) -> yf.Ticker:
-    """Create a yf.Ticker that uses our rate-limit-proof session."""
-    session = _make_session()
-    return yf.Ticker(ticker, session=session)
-
-
-def _retry_fetch(fetch_fn, max_attempts: int = 4, base_delay: float = 2.0):
+def _retry_fetch(fetch_fn, max_attempts: int = 4, base_delay: float = 3.0):
     """
-    Wrap any yfinance call with retry + exponential backoff.
-    Catches YFRateLimitError specifically and waits before retrying.
+    Retry any yfinance call with exponential backoff.
+    Handles both YFRateLimitError and generic transient failures.
     """
-    from yfinance.exceptions import YFRateLimitError
     last_exc = None
     for attempt in range(max_attempts):
         try:
             return fetch_fn()
-        except YFRateLimitError as e:
-            last_exc = e
-            wait = base_delay * (2 ** attempt) + random.uniform(0.5, 2.0)
-            time.sleep(wait)
         except Exception as e:
             last_exc = e
-            # Non-rate-limit errors: retry once then give up
-            if attempt < 1:
-                time.sleep(1.0)
+            err = str(e).lower()
+            is_rate_limit = any(x in err for x in
+                                ["ratelimit", "rate limit", "429", "too many"])
+            if is_rate_limit or attempt < max_attempts - 1:
+                wait = base_delay * (2 ** attempt) + random.uniform(0.5, 2.0)
+                time.sleep(wait)
             else:
                 raise
     raise last_exc
 
 
-# ── Cached fetchers — each ticker's data is fetched ONCE per hour ────────────
+# ── Cached fetchers — one HTTP round-trip per ticker per hour ────────────────
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def _fetch_info(ticker: str) -> dict:
-    tk = _yf_ticker_with_session(ticker)
-    return _retry_fetch(lambda: tk.info) or {}
+    """Fetch ticker.info with retry. No session argument — yfinance handles it."""
+    return _retry_fetch(lambda: yf.Ticker(ticker).info) or {}
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def _fetch_financials(ticker: str) -> dict:
-    """Returns all three financial statements as serialisable dicts."""
-    tk = _yf_ticker_with_session(ticker)
+    """Fetch all three financial statements, serialised as dicts for caching."""
+    tk  = yf.Ticker(ticker)
     out = {"income": {}, "balance": {}, "cashflow": {}}
-    try:
-        df = _retry_fetch(lambda: tk.financials)
-        if df is not None and not df.empty:
-            out["income"] = df.to_dict()
-    except Exception:
-        pass
-    try:
-        df = _retry_fetch(lambda: tk.balance_sheet)
-        if df is not None and not df.empty:
-            out["balance"] = df.to_dict()
-    except Exception:
-        pass
-    try:
-        df = _retry_fetch(lambda: tk.cashflow)
-        if df is not None and not df.empty:
-            out["cashflow"] = df.to_dict()
-    except Exception:
-        pass
+    for key, fn in [
+        ("income",   lambda: tk.financials),
+        ("balance",  lambda: tk.balance_sheet),
+        ("cashflow", lambda: tk.cashflow),
+    ]:
+        try:
+            df = _retry_fetch(fn)
+            if df is not None and not df.empty:
+                # Convert column DatetimeIndex to strings so st.cache_data can hash it
+                df.columns = df.columns.astype(str)
+                out[key] = df.to_dict()
+        except Exception:
+            pass
     return out
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def _fetch_history(ticker: str) -> dict:
-    tk = _yf_ticker_with_session(ticker)
     try:
-        df = _retry_fetch(lambda: tk.history(period="1y"))
-        return df.to_dict() if df is not None and not df.empty else {}
+        df = _retry_fetch(lambda: yf.Ticker(ticker).history(period="1y"))
+        if df is not None and not df.empty:
+            df.index = df.index.astype(str)
+            return df.to_dict()
     except Exception:
-        return {}
+        pass
+    return {}
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  PAGE CONFIG
@@ -418,12 +373,21 @@ class StockData:
         self._stmt_scale = self._compute_stmt_scale()
 
     def _load_financials(self):
-        """Load financial statements from the cache (no new HTTP requests)."""
+        """Reconstruct DataFrames from the cached dict. No new HTTP requests."""
         try:
             stmts = _fetch_financials(self.ticker)
-            self.income_stmt   = pd.DataFrame(stmts.get("income",   {}))
-            self.balance_sheet = pd.DataFrame(stmts.get("balance",  {}))
-            self.cashflow      = pd.DataFrame(stmts.get("cashflow", {}))
+
+            def _rebuild(d: dict) -> pd.DataFrame:
+                if not d:
+                    return pd.DataFrame()
+                df = pd.DataFrame(d)
+                # Columns are stored as strings ("2024-03-31"); keep as-is —
+                # _stmt_row_raw only cares about the index (row labels), not columns
+                return df
+
+            self.income_stmt   = _rebuild(stmts.get("income",   {}))
+            self.balance_sheet = _rebuild(stmts.get("balance",  {}))
+            self.cashflow      = _rebuild(stmts.get("cashflow", {}))
         except Exception:
             self.income_stmt = self.balance_sheet = self.cashflow = pd.DataFrame()
 
@@ -431,7 +395,11 @@ class StockData:
     def price_history(self) -> pd.DataFrame:
         try:
             raw = _fetch_history(self.ticker)
-            return pd.DataFrame(raw) if raw else pd.DataFrame()
+            if not raw:
+                return pd.DataFrame()
+            df = pd.DataFrame(raw)
+            df.index = pd.to_datetime(df.index)
+            return df
         except Exception:
             return pd.DataFrame()
 
