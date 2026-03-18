@@ -306,24 +306,61 @@ class StockData:
         return None
 
     def _compute_stmt_scale(self) -> float:
-        reported_eps = (self.info.get("trailingEps") or
-                        self.info.get("epsTrailingTwelveMonths"))
-        shares = (self.info.get("sharesOutstanding") or
-                  self.info.get("impliedSharesOutstanding"))
-        if not reported_eps or reported_eps <= 0 or not shares:
-            return 1.0
-        ni_raw = self._stmt_row_raw(
+        """
+        Detect unit mismatch between financial statements and ticker.info.
+
+        ROOT CAUSE for INFY.NS and similar NSE tickers:
+          yfinance's info["freeCashflow"] and info["ebitda"] sometimes return
+          USD values for INR-listed stocks, OR Crore-unit values without the
+          ×10^7 multiplier. The cashflow/income statements, however, are always
+          in full local-currency units. We compute a correction factor by
+          comparing info["netIncomeToCommon"] (always reliable, full INR) against
+          the raw Net Income row from the statement.
+        """
+        import math
+
+        # ── Primary anchor: netIncomeToCommon from info ───────────────────────
+        # This field is always in correct local currency (full units, not Crore).
+        ni_info = self._get("netIncomeToCommon")
+        if ni_info and float(ni_info) > 0:
+            ni_info = float(ni_info)
+        else:
+            # Fallback: derive from trailingEps × sharesOutstanding
+            eps    = (self._get("trailingEps") or
+                      self._get("epsTrailingTwelveMonths"))
+            shares = (self._get("sharesOutstanding") or
+                      self._get("impliedSharesOutstanding"))
+            if not eps or not shares or float(eps) <= 0 or float(shares) <= 0:
+                return 1.0
+            ni_info = float(eps) * float(shares)
+
+        # ── Raw Net Income from statement ─────────────────────────────────────
+        ni_stmt = self._stmt_row_raw(
             self.income_stmt,
             "Net Income", "Net Income Common Stockholders",
             "Net Income Applicable To Common Shares",
+            "Net Income Including Noncontrolling Interests",
         )
-        if ni_raw is None or ni_raw <= 0:
+        if ni_stmt is None or ni_stmt <= 0:
             return 1.0
-        for f in [1, 10, 100, 1_000, 10_000, 100_000, 1_000_000,
-                  0.1, 0.01, 0.001]:
-            if 0.2 <= (ni_raw / f / shares) / reported_eps <= 5.0:
-                return f
-        return 1.0
+
+        ratio = ni_stmt / ni_info   # ideal = 1.0 when units match
+
+        # ── Find nearest power-of-10 scale factor ─────────────────────────────
+        power = round(math.log10(ratio))
+        scale = 10.0 ** power
+
+        # Validate: after dividing by scale, statement ≈ info (within 50%)
+        if 0.5 <= (ni_stmt / scale) / ni_info <= 2.0:
+            return scale
+
+        # Try ±1 power if primary doesn't fit
+        for adj in [-1, 1, -2, 2]:
+            adj_scale = 10.0 ** (power + adj)
+            if adj_scale > 0 and 0.5 <= (ni_stmt / adj_scale) / ni_info <= 2.0:
+                return adj_scale
+
+        return 1.0   # no mismatch detected — statements already in correct units
 
     def _stmt_row(self, stmt, *keys):
         v = self._stmt_row_raw(stmt, *keys)
@@ -350,15 +387,71 @@ class StockData:
 
     @property
     def revenue(self) -> Optional[float]:
+        """
+        Total revenue. Prefers statement (scaled) for international tickers,
+        falls back to info["totalRevenue"] which is usually reliable.
+        """
+        # Try statement first (correctly scaled)
+        v_stmt = self._stmt_row(self.income_stmt, "Total Revenue", "Revenue", "Net Revenue")
+        if v_stmt and v_stmt > 0:
+            # Cross-validate: if info also has it, they should be within 30%
+            v_info = self._get("totalRevenue")
+            if v_info and float(v_info) > 0:
+                ratio = v_stmt / float(v_info)
+                if 0.7 <= ratio <= 1.3:
+                    return v_stmt          # statement and info agree ✓
+                else:
+                    return float(v_info)   # info is more trusted when they diverge
+            return v_stmt
+        # Fall back to info
         v = self._get("totalRevenue")
-        if v: return float(v)
-        return self._stmt_row(self.income_stmt, "Total Revenue", "Revenue")
+        return float(v) if v else None
 
     @property
     def ebitda(self) -> Optional[float]:
+        """
+        EBITDA computed from financial statements (scaled), not info["ebitda"].
+
+        CRITICAL FIX: info["ebitda"] has the same unit-mismatch issue as
+        info["freeCashflow"] for NSE-listed stocks. Computing from statements
+        (after scale correction) is the reliable path.
+        EBITDA = Operating Income (EBIT) + Depreciation & Amortization.
+        """
+        # ── Try direct EBITDA row from income statement ───────────────────────
+        v = self._stmt_row(self.income_stmt, "EBITDA", "Normalized EBITDA")
+        if v and v > 0:
+            return v
+
+        # ── Compute: EBITDA = EBIT + D&A ─────────────────────────────────────
+        ebit = self._stmt_row(
+            self.income_stmt,
+            "EBIT", "Operating Income", "Operating Income Or Loss",
+            "Total Operating Income As Reported",
+        )
+        da = self._stmt_row(
+            self.cashflow,
+            "Depreciation And Amortization",
+            "Depreciation Amortization Depletion",
+            "Depreciation",
+        )
+        if ebit is not None and da is not None:
+            return ebit + abs(da)
+
+        # ── If only EBIT available, estimate D&A from revenue ────────────────
+        if ebit is not None and ebit > 0:
+            rev = self.revenue
+            da_estimate = rev * 0.04 if rev else 0   # ~4% D&A/revenue fallback
+            return ebit + da_estimate
+
+        # ── Last resort: info field, validated against revenue margin ─────────
         v = self._get("ebitda")
-        if v: return float(v)
-        return self._stmt_row(self.income_stmt, "EBITDA", "Normalized EBITDA")
+        if v and float(v) > 0:
+            rev = self.revenue
+            if rev and float(rev) > 0:
+                margin = float(v) / rev
+                if 0.05 <= margin <= 0.80:   # EBITDA margin must be 5–80%
+                    return float(v)
+        return None
 
     @property
     def net_income(self) -> Optional[float]:
@@ -378,13 +471,51 @@ class StockData:
 
     @property
     def fcf(self) -> Optional[float]:
+        """
+        Free Cash Flow = Operating CF − Capital Expenditure.
+
+        CRITICAL FIX: info["freeCashflow"] is intentionally NOT used as the
+        primary source. For NSE-listed stocks (e.g. INFY.NS, TCS.NS), yfinance
+        sometimes returns this field in USD instead of INR, causing DCF values
+        to be ~83× too small. The cashflow statement is always in local currency
+        and is corrected by _stmt_scale, so it is the ground truth.
+        """
+        # ── Primary: compute from cashflow statement (always in local currency) ─
+        ocf = self._stmt_row(
+            self.cashflow,
+            "Operating Cash Flow", "Cash From Operations",
+            "Total Cash From Operating Activities",
+            "Net Cash Provided By Operating Activities",
+        )
+        capex = self._stmt_row(
+            self.cashflow,
+            "Capital Expenditure", "Capital Expenditures",
+            "Purchase Of Property Plant And Equipment",
+            "Capital Expenditures Reported",
+        )
+        if ocf is not None and capex is not None:
+            result = ocf + capex   # CapEx is stored negative in yfinance
+            if result > 0:
+                return result
+            # If negative FCF, still return it — callers check for > 0
+            if ocf > 0:
+                return result
+
+        # ── If only OCF available, estimate FCF conservatively ───────────────
+        if ocf is not None and ocf > 0:
+            # Use 85% of OCF as a conservative FCF estimate
+            return ocf * 0.85
+
+        # ── Last resort: info field, validated against revenue ────────────────
+        # Only trusted if FCF margin is in a realistic 5–60% range
         v = self._get("freeCashflow")
-        if v and float(v) > 0: return float(v)
-        ocf = self._stmt_row(self.cashflow, "Operating Cash Flow",
-                             "Total Cash From Operating Activities")
-        cap = self._stmt_row(self.cashflow, "Capital Expenditure",
-                             "Capital Expenditures")
-        if ocf and cap: return ocf + cap
+        if v and float(v) > 0:
+            rev = self._get("totalRevenue")
+            if rev and float(rev) > 0:
+                if 0.05 <= float(v) / float(rev) <= 0.60:
+                    return float(v)
+            else:
+                return float(v)   # no revenue to validate against, use as-is
         return None
 
     @property
@@ -464,10 +595,22 @@ class StockData:
         }
         missing = [k for k, v in fields.items() if v is None or v == 0.0]
         present = [k for k, v in fields.items() if v is not None and v != 0.0]
+        sf = self._stmt_scale
+
+        # BUG 3 FIX: format scale factor properly for all magnitudes
+        if sf == 1.0:
+            scale_display = None          # no correction — don't show warning
+        elif sf >= 1:
+            scale_display = f"×{sf:,.0f}"
+        else:
+            scale_display = f"÷{1/sf:,.0f}"   # e.g. 0.1 → "÷10"
+
         return {
-            "score_pct": round(len(present)/len(fields)*100, 0),
-            "present": present, "missing": missing,
-            "scale_factor": self._stmt_scale,
+            "score_pct": round(len(present) / len(fields) * 100, 0),
+            "present": present,
+            "missing": missing,
+            "scale_factor": sf,
+            "scale_display": scale_display,   # human-readable, never shows "×0"
         }
 
 
@@ -1062,7 +1205,7 @@ def main():
         {len(qr['present'])}/{len(qr['present'])+len(qr['missing'])} fields available
       </span>
       {"<span style='color:#f85149;font-size:0.8rem'>Missing: " + missing_txt + "</span>" if qr["missing"] else ""}
-      {"<span style='color:#d29922;font-size:0.8rem'>⚠ Scale correction applied ×" + f"{qr['scale_factor']:,.0f}" + "</span>" if qr["scale_factor"] != 1.0 else ""}
+      {"<span style='color:#d29922;font-size:0.8rem'>⚠ Statement unit correction: " + qr['scale_display'] + " applied to financials</span>" if qr.get("scale_display") else ""}
     </div>
     """, unsafe_allow_html=True)
 
