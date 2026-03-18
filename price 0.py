@@ -16,10 +16,126 @@ from dataclasses import dataclass
 from typing import Optional, List
 import warnings
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from bs4 import BeautifulSoup
 import time
+import random
 
 warnings.filterwarnings("ignore")
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  RATE-LIMIT-PROOF SESSION + CACHED yfinance FETCHERS
+#  ROOT CAUSE: Streamlit Cloud shares one IP across thousands of apps.
+#  Yahoo Finance blocks shared IPs that make too many requests.
+#  FIX 1 — Rotate User-Agent headers so requests look like a real browser.
+#  FIX 2 — Wrap every yf call in @st.cache_data(ttl=3600) so the same
+#           ticker is only fetched ONCE per hour, not on every UI interaction.
+#  FIX 3 — Retry with exponential backoff on 429 / 5xx responses.
+# ─────────────────────────────────────────────────────────────────────────────
+
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 "
+    "(KHTML, like Gecko) Version/17.2.1 Safari/605.1.15",
+    "Mozilla/5.0 (X11; Linux x86_64; rv:124.0) Gecko/20100101 Firefox/124.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0",
+]
+
+def _make_session() -> requests.Session:
+    """Build a requests Session with retry logic and rotating User-Agent."""
+    session = requests.Session()
+    retry = Retry(
+        total=5,
+        backoff_factor=1.5,          # waits: 1.5s, 3s, 6s, 12s, 24s
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET"],
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    session.headers.update({
+        "User-Agent": random.choice(USER_AGENTS),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+    })
+    return session
+
+
+def _yf_ticker_with_session(ticker: str) -> yf.Ticker:
+    """Create a yf.Ticker that uses our rate-limit-proof session."""
+    session = _make_session()
+    return yf.Ticker(ticker, session=session)
+
+
+def _retry_fetch(fetch_fn, max_attempts: int = 4, base_delay: float = 2.0):
+    """
+    Wrap any yfinance call with retry + exponential backoff.
+    Catches YFRateLimitError specifically and waits before retrying.
+    """
+    from yfinance.exceptions import YFRateLimitError
+    last_exc = None
+    for attempt in range(max_attempts):
+        try:
+            return fetch_fn()
+        except YFRateLimitError as e:
+            last_exc = e
+            wait = base_delay * (2 ** attempt) + random.uniform(0.5, 2.0)
+            time.sleep(wait)
+        except Exception as e:
+            last_exc = e
+            # Non-rate-limit errors: retry once then give up
+            if attempt < 1:
+                time.sleep(1.0)
+            else:
+                raise
+    raise last_exc
+
+
+# ── Cached fetchers — each ticker's data is fetched ONCE per hour ────────────
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _fetch_info(ticker: str) -> dict:
+    tk = _yf_ticker_with_session(ticker)
+    return _retry_fetch(lambda: tk.info) or {}
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _fetch_financials(ticker: str) -> dict:
+    """Returns all three financial statements as serialisable dicts."""
+    tk = _yf_ticker_with_session(ticker)
+    out = {"income": {}, "balance": {}, "cashflow": {}}
+    try:
+        df = _retry_fetch(lambda: tk.financials)
+        if df is not None and not df.empty:
+            out["income"] = df.to_dict()
+    except Exception:
+        pass
+    try:
+        df = _retry_fetch(lambda: tk.balance_sheet)
+        if df is not None and not df.empty:
+            out["balance"] = df.to_dict()
+    except Exception:
+        pass
+    try:
+        df = _retry_fetch(lambda: tk.cashflow)
+        if df is not None and not df.empty:
+            out["cashflow"] = df.to_dict()
+    except Exception:
+        pass
+    return out
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _fetch_history(ticker: str) -> dict:
+    tk = _yf_ticker_with_session(ticker)
+    try:
+        df = _retry_fetch(lambda: tk.history(period="1y"))
+        return df.to_dict() if df is not None and not df.empty else {}
+    except Exception:
+        return {}
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  PAGE CONFIG
@@ -238,24 +354,22 @@ def get_competitors_scrape(ticker: str, max_peers: int = 5) -> List[str]:
 
 
 def find_competitors(ticker: str, max_peers: int = 5) -> List[str]:
-    """Try multiple strategies; merge results; validate each peer via yfinance."""
-    # Try API first (fastest), then scraping
+    """Try multiple strategies; merge results; validate each peer via cached fetcher."""
     peers = get_competitors_yfinance(ticker, max_peers * 2)
     if len(peers) < 2:
         peers += get_competitors_scrape(ticker, max_peers * 2)
 
-    # Remove duplicates, remove self
     seen, clean = set(), []
     for p in peers:
         if p.upper() != ticker.upper() and p.upper() not in seen:
             seen.add(p.upper())
             clean.append(p.upper())
 
-    # Validate each peer has a real price
+    # Validate each peer using cached info fetcher (no extra HTTP cost)
     valid = []
     for p in clean[:max_peers + 3]:
         try:
-            info = yf.Ticker(p).info
+            info = _fetch_info(p)
             if info.get("currentPrice") or info.get("regularMarketPrice"):
                 valid.append(p)
         except Exception:
@@ -273,15 +387,29 @@ def find_competitors(ticker: str, max_peers: int = 5) -> List[str]:
 class StockData:
     def __init__(self, ticker: str):
         self.ticker = ticker.upper()
-        self._tk   = yf.Ticker(self.ticker)
-        self.info  = self._tk.info or {}
+
+        # ── All network calls go through cached + retrying fetchers ──────────
+        try:
+            self.info = _fetch_info(self.ticker)
+        except Exception as e:
+            err = str(e)
+            if "RateLimit" in err or "429" in err:
+                raise ValueError(
+                    "Yahoo Finance rate limit hit. Please wait 30 seconds "
+                    "and try again. This happens when many users query "
+                    "simultaneously on Streamlit Cloud."
+                )
+            raise ValueError(f"Could not fetch data for '{self.ticker}': {err}")
 
         if not self.info or (
             self.info.get("regularMarketPrice") is None and
             self.info.get("currentPrice") is None and
             self.info.get("previousClose") is None
         ):
-            raise ValueError(f"'{self.ticker}' not found on Yahoo Finance.")
+            raise ValueError(
+                f"'{self.ticker}' not found on Yahoo Finance. "
+                f"Check the ticker symbol (e.g. INFY.NS for NSE, TCS.BO for BSE)."
+            )
 
         self.currency        = self.info.get("currency", "USD")
         self.currency_symbol = CURRENCY_SYMBOLS.get(self.currency, self.currency + " ")
@@ -290,12 +418,22 @@ class StockData:
         self._stmt_scale = self._compute_stmt_scale()
 
     def _load_financials(self):
+        """Load financial statements from the cache (no new HTTP requests)."""
         try:
-            self.income_stmt   = self._tk.financials
-            self.balance_sheet = self._tk.balance_sheet
-            self.cashflow      = self._tk.cashflow
+            stmts = _fetch_financials(self.ticker)
+            self.income_stmt   = pd.DataFrame(stmts.get("income",   {}))
+            self.balance_sheet = pd.DataFrame(stmts.get("balance",  {}))
+            self.cashflow      = pd.DataFrame(stmts.get("cashflow", {}))
         except Exception:
             self.income_stmt = self.balance_sheet = self.cashflow = pd.DataFrame()
+
+    @property
+    def price_history(self) -> pd.DataFrame:
+        try:
+            raw = _fetch_history(self.ticker)
+            return pd.DataFrame(raw) if raw else pd.DataFrame()
+        except Exception:
+            return pd.DataFrame()
 
     def _stmt_row_raw(self, stmt, *keys):
         for k in keys:
@@ -578,13 +716,6 @@ class StockData:
         ev = self._get("enterpriseValue")
         if ev: return float(ev)
         return self.market_cap + self.total_debt - self.cash
-
-    @property
-    def price_history(self) -> pd.DataFrame:
-        try:
-            return self._tk.history(period="1y")
-        except Exception:
-            return pd.DataFrame()
 
     def quality_report(self) -> dict:
         fields = {
@@ -1136,7 +1267,28 @@ def main():
         try:
             data = StockData(ticker_input)
         except ValueError as e:
-            st.error(f"❌ {e}")
+            err_msg = str(e)
+            if "rate limit" in err_msg.lower() or "429" in err_msg:
+                st.error("⏳ **Yahoo Finance Rate Limit**")
+                st.markdown("""
+                <div style="background:#1c2333;border:1px solid #d29922;border-radius:8px;
+                            padding:1.2rem 1.5rem;margin:0.5rem 0">
+                  <div style="color:#d29922;font-weight:600;margin-bottom:0.5rem">
+                    What happened?
+                  </div>
+                  <div style="color:#c9d1d9;font-size:0.9rem;line-height:1.7">
+                    Streamlit Cloud shares one IP address across thousands of apps.
+                    Yahoo Finance temporarily blocks shared IPs that make too many
+                    requests. This is not a bug in the app.<br><br>
+                    <strong style="color:#e6edf3">What to do:</strong><br>
+                    1. Wait <strong>30–60 seconds</strong> and click Run Valuation again<br>
+                    2. If it keeps happening, try a different ticker first to reset the cache<br>
+                    3. The app caches data for 1 hour — once loaded, it won't rate-limit again
+                  </div>
+                </div>
+                """, unsafe_allow_html=True)
+            else:
+                st.error(f"❌ {err_msg}")
             return
 
     s = sym(data.currency)
